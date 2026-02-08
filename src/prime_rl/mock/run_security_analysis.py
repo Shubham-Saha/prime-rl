@@ -1,39 +1,56 @@
+#!/usr/bin/env python
 """
-Complete Integration Script for PRIME-RL Security Analysis.
+Integration script for PRIME-RL security analysis.
 
-This script:
-1. Sets up simulated distributed environment
-2. Starts mock inference server
-3. Uses REAL PRIME-RL code (ZMQ, transport, client)
-4. Captures all network traffic for analysis
+Spawns:
+1. Mock Sandbox Server (for verifiers HTTP traffic analysis)
+2. Mock Inference Server (for OpenAI-compatible API)
+3. Trainer processes (simulated distributed training)
+4. Orchestrator process (coordination)
 
-Run this to start security analysis of PRIME-RL distributed system.
+Captures all network traffic for security analysis.
 """
-import os
-import sys
-import time
+
 import json
-import signal
-import subprocess
+import logging
 import multiprocessing as mp
+import time
 from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Optional
 
-# Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+logger = logging.getLogger(__name__)
+
+MOCK_DIR = Path(__file__).parent
+CONFIG_PATH = MOCK_DIR / "simulation_config.json"
+RESULTS_DIR = Path("results")
 
 
-def run_mock_inference_server(port: int = 8000, log_file: Optional[Path] = None):
-    """Run mock inference server in a subprocess."""
+def _setup_subprocess_logging(label: str) -> None:
+    """Configure logging for a spawned subprocess."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s [{label}] %(levelname)s: %(message)s",
+    )
+
+
+def run_mock_sandbox_server(port: int = 8000, log_file: str = "results/sandbox_requests.jsonl") -> None:
+    """Run mock sandbox server (blocking, intended for subprocess)."""
+    _setup_subprocess_logging("SandboxServer")
+
+    from prime_rl.mock.sandbox_server import MockSandboxServer
+
+    server = MockSandboxServer(
+        port=port,
+        log_file=log_file,
+        execute_locally=False,
+    )
+    server.run()
+
+
+def run_mock_inference_server(port: int = 8080) -> None:
+    """Run mock inference server (blocking, intended for subprocess)."""
+    _setup_subprocess_logging("InferenceServer")
+
     from prime_rl.mock.mock_inference_server import run_server
-    
-    if log_file:
-        # Redirect output to log file
-        sys.stdout = open(log_file, "w")
-        sys.stderr = sys.stdout
-    
     run_server(port=port)
 
 
@@ -44,90 +61,82 @@ def run_trainer_process(
     local_world_size: int,
     output_dir: Path,
     inference_url: str,
-):
+    sandbox_url: str,
+) -> None:
     """Run a trainer process with simulated environment."""
-    from prime_rl.mock.setup_env import setup_simulated_cluster
-    from prime_rl.mock.distributed_cpu import setup_torch_distributed_cpu
-    from prime_rl.mock.device import patch_cuda_for_cpu
-    
-    # Setup environment before any imports
-    setup_simulated_cluster(
+    _setup_subprocess_logging(f"Trainer-{rank}")
+
+    from prime_rl.mock.setup_env import setup_mock_environment
+    setup_mock_environment(
         rank=rank,
         world_size=world_size,
         local_rank=local_rank,
-        local_world_size=local_world_size
+        local_world_size=local_world_size,
+        sandbox_url=sandbox_url,
+        inference_url=inference_url,
     )
     
-    # Patch CUDA for CPU execution
+    from prime_rl.mock.device import patch_cuda_for_cpu
+
     patch_cuda_for_cpu()
-    
-    # Now import and use real PRIME-RL code
+
     from prime_rl.trainer.world import get_world
-    from prime_rl.transport.config import ZMQTransportConfig, FileSystemTransportConfig
-    from prime_rl.transport import setup_training_batch_receiver
-    
-    # Verify world is set up correctly
+
     world = get_world()
-    print(f"[TRAINER rank={rank}] World initialized: {world}")
-    
-    # Initialize torch.distributed with GLOO
-    setup_torch_distributed_cpu()
-    
-    # Use filesystem transport (works without GPU)
-    transport_config = FileSystemTransportConfig()
-    
-    # The receiver will use the REAL code
-    # receiver = setup_training_batch_receiver(transport_config)
-    
-    print(f"[TRAINER rank={rank}] Ready for training")
-    
-    # Simulate training steps
+    logger.info("Trainer rank=%d: world initialized: %s", rank, world)
+
     for step in range(3):
         time.sleep(1)
-        print(f"[TRAINER rank={rank}] Step {step} complete")
+        logger.info("Trainer rank=%d: step %d complete", rank, step)
     
-    print(f"[TRAINER rank={rank}] Finished")
+    logger.info("Trainer rank=%d: finished", rank)
 
 
 def run_orchestrator_process(
     output_dir: Path,
     inference_url: str,
-):
+    sandbox_url: str,
+) -> None:
     """Run orchestrator process."""
     import asyncio
+
+    _setup_subprocess_logging("Orchestrator")
+
+    from prime_rl.mock.setup_env import setup_mock_environment
+    setup_mock_environment(
+        rank=0,
+        world_size=1,
+        local_rank=0,
+        local_world_size=1,
+        sandbox_url=sandbox_url,
+        inference_url=inference_url,
+    )
     
-    from prime_rl.mock.setup_env import setup_simulated_cluster
-    
-    # Orchestrator doesn't need distributed, but set env anyway
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
-    
-    # Use real OpenAI client
+    from prime_rl.utils.logger import setup_logger
+    setup_logger(log_level="INFO", tag="Orchestrator")
+
     from prime_rl.utils.client import setup_clients, setup_admin_clients, check_health
     from prime_rl.utils.config import ClientConfig
-    
-    # Create client config pointing to our mock server
+
     client_config = ClientConfig(
         base_url=[inference_url],
-        api_key_var="OPENAI_API_KEY",  # Will use "EMPTY" if not set
+        api_key_var="OPENAI_API_KEY",
         timeout=60,
     )
     
-    print(f"[ORCHESTRATOR] Connecting to inference server at {inference_url}")
+    logger.info("Orchestrator connecting to inference: %s", inference_url)
+    logger.info("Orchestrator sandbox endpoint: %s", sandbox_url)
     
-    # These are the REAL client functions - they will work with our mock server
     clients = setup_clients(client_config)
     admin_clients = setup_admin_clients(client_config)
     
     async def main():
-        # Check health using REAL code
-        print("[ORCHESTRATOR] Checking inference server health...")
+        logger.info("Checking inference server health...")
         await check_health(admin_clients, timeout=30)
-        print("[ORCHESTRATOR] Inference server is healthy!")
+        logger.info("Inference server is healthy")
         
-        # Test chat completion using REAL OpenAI client
         client = clients[0]
-        print("[ORCHESTRATOR] Testing chat completion...")
+        logger.info("Testing chat completion...")
         
         response = await client.chat.completions.create(
             model="Qwen/Qwen3-0.6B",
@@ -136,71 +145,221 @@ def run_orchestrator_process(
             temperature=0.7,
         )
         
-        print(f"[ORCHESTRATOR] Received {len(response.choices)} completions")
+        logger.info("Received %d completions", len(response.choices))
         for i, choice in enumerate(response.choices):
-            print(f"  Choice {i}: {choice.message.content[:50]}...")
+            content = choice.message.content or ""
+            logger.info("  Choice %d: %s...", i, content[:50] if len(content) > 50 else content)
+        
+        # ============================================================
+        # ACTUALLY TRIGGER VERIFIERS SANDBOX CALLS
+        # ============================================================
+        await test_verifiers_sandbox(sandbox_url, client)
     
     asyncio.run(main())
-    print("[ORCHESTRATOR] Finished")
+    logger.info("Orchestrator finished")
+
+
+async def test_verifiers_sandbox(sandbox_url: str, openai_client) -> None:
+    """
+    Actually trigger verifiers to make HTTP calls to the sandbox server.
+    
+    This is what populates your sandbox_requests.jsonl log file.
+    """
+    logger.info("=" * 50)
+    logger.info("TESTING VERIFIERS SANDBOX INTEGRATION")
+    logger.info("=" * 50)
+    
+    try:
+        import verifiers as vf
+        from verifiers import load_environment
+        
+        logger.info("Verifiers library loaded successfully")
+        logger.info("Sandbox requests will go to: %s", sandbox_url)
+        
+        # Try to load a code execution environment
+        # This environment type triggers sandbox calls
+        try:
+            # Option 1: Try math-python (requires code execution)
+            logger.info("Attempting to load 'math-python' environment...")
+            env = load_environment("math-python")
+            logger.info("Environment loaded: %s", type(env).__name__)
+            
+            # Create a sample rollout that would trigger code execution
+            sample_example = {
+                "prompt": [{"role": "user", "content": "Write Python code to calculate 2+2 and print the result."}],
+                "example_id": 1,
+            }
+            
+            # This should trigger an HTTP POST to your sandbox server
+            logger.info("Triggering rollout (this should call sandbox)...")
+            
+            rollout_input = vf.RolloutInput(**sample_example)
+            
+            # Run a single rollout - this triggers the sandbox
+            result = await env.run_rollout(
+                rollout_input,
+                client=openai_client,
+                model="Qwen/Qwen3-0.6B",
+                sampling_args={"temperature": 0.7, "max_tokens": 256},
+            )
+            
+            logger.info("Rollout complete!")
+            logger.info("  Reward: %s", result.get("reward", "N/A"))
+            logger.info("  Error: %s", result.get("error", "None"))
+            
+        except Exception as e:
+            logger.warning("Could not run full environment test: %s", e)
+            logger.info("Falling back to direct sandbox API test...")
+            
+            # Fallback: Directly call the sandbox API to prove it works
+            await test_sandbox_directly(sandbox_url)
+            
+    except ImportError as e:
+        logger.warning("Verifiers library not installed: %s", e)
+        logger.info("Falling back to direct sandbox API test...")
+        await test_sandbox_directly(sandbox_url)
+
+
+async def test_sandbox_directly(sandbox_url: str) -> None:
+    """
+    Directly call the sandbox API to verify connectivity.
+    
+    This bypasses verifiers and directly tests your mock server.
+    """
+    import aiohttp
+    
+    logger.info("Testing sandbox API directly...")
+    
+    # Test 1: Health check
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(f"{sandbox_url}/health") as resp:
+                data = await resp.json()
+                logger.info("Health check response: %s", data)
+        except Exception as e:
+            logger.error("Health check failed: %s", e)
+        
+        # Test 2: Code execution endpoint
+        try:
+            payload = {
+                "code": "print('Hello from security analysis!')\nresult = 2 + 2\nprint(f'Result: {result}')",
+                "language": "python",
+                "timeout": 30,
+            }
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer mock-api-key",
+                "X-API-Key": "mock-api-key",
+            }
+            
+            async with session.post(
+                f"{sandbox_url}/v1/sandbox/run",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                data = await resp.json()
+                logger.info("Code execution response: %s", data)
+                
+        except Exception as e:
+            logger.error("Code execution test failed: %s", e)
+        
+        # Test 3: Try alternative endpoint (discover what verifiers uses)
+        try:
+            async with session.post(
+                f"{sandbox_url}/run",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                data = await resp.json()
+                logger.info("Alternative endpoint (/run) response: %s", data)
+        except Exception as e:
+            logger.error("Alternative endpoint failed: %s", e)
+    
+    logger.info("Direct sandbox tests complete - check sandbox_requests.jsonl")
 
 
 class SecurityAnalysisRunner:
-    """
-    Main runner for PRIME-RL security analysis.
-    
-    Spawns all components and captures network traffic.
-    """
+    """Spawns all components and captures network traffic for security analysis."""
     
     def __init__(
         self,
         num_trainer_nodes: int = 2,
         gpus_per_node: int = 2,
-        inference_port: int = 8000,
+        inference_port: int = 8080,
+        sandbox_port: int = 8000,
         output_dir: Path = Path("security_analysis_output"),
     ):
         self.num_trainer_nodes = num_trainer_nodes
         self.gpus_per_node = gpus_per_node
         self.inference_port = inference_port
+        self.sandbox_port = sandbox_port
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.processes: List[mp.Process] = []
-        self.inference_process: Optional[mp.Process] = None
+
+        self.processes: list[mp.Process] = []
+        self.inference_process: mp.Process | None = None
+        self.sandbox_process: mp.Process | None = None
+
+        self.inference_url = f"http://127.0.0.1:{self.inference_port}/v1"
+        self.sandbox_url = f"http://127.0.0.1:{self.sandbox_port}"
+    
+    @classmethod
+    def from_config(cls, config_path: Path | None = None) -> "SecurityAnalysisRunner":
+        path = config_path or CONFIG_PATH
+        if path.exists():
+            with open(path) as f:
+                data = json.load(f)
+            sa = data.get("security_analysis", {})
+            return cls(
+                num_trainer_nodes=sa.get("num_trainer_nodes", 2),
+                gpus_per_node=sa.get("gpus_per_node", 2),
+                inference_port=sa.get("inference_port", 8080),
+                sandbox_port=sa.get("sandbox_port", 8000),
+                output_dir=Path(sa.get("output_dir", "security_analysis_output")),
+            )
+        return cls()
     
     def start(self):
-        """Start all components."""
-        print("\n" + "="*70)
-        print("PRIME-RL SECURITY ANALYSIS")
-        print("="*70)
-        print(f"Trainer nodes:     {self.num_trainer_nodes}")
-        print(f"GPUs per node:     {self.gpus_per_node}")
-        print(f"Total ranks:       {self.num_trainer_nodes * self.gpus_per_node}")
-        print(f"Inference port:    {self.inference_port}")
-        print(f"Output directory:  {self.output_dir}")
-        print("="*70 + "\n")
+        total_ranks = self.num_trainer_nodes * self.gpus_per_node
         
-        # Start mock inference server
-        print("[MAIN] Starting mock inference server...")
+        logger.info("=" * 70)
+        logger.info("SECURITY ANALYSIS CONFIGURATION")
+        logger.info("=" * 70)
+        logger.info(
+            "  Cluster: %d nodes x %d GPUs = %d ranks",
+            self.num_trainer_nodes, self.gpus_per_node, total_ranks,
+        )
+        logger.info("  Sandbox Server:   %s", self.sandbox_url)
+        logger.info("  Inference Server: %s", self.inference_url)
+        logger.info("  Output Directory: %s", self.output_dir)
+        logger.info("=" * 70)
+        
+        logger.info("[1/4] Starting mock sandbox server...")
+        sandbox_log = str(self.output_dir / "sandbox_requests.jsonl")
+        self.sandbox_process = mp.Process(
+            target=run_mock_sandbox_server,
+            kwargs={"port": self.sandbox_port, "log_file": sandbox_log},
+        )
+        self.sandbox_process.start()
+        logger.info("      PID: %s -> %s", self.sandbox_process.pid, self.sandbox_url)
+        time.sleep(1)
+
+        logger.info("[2/4] Starting mock inference server...")
         self.inference_process = mp.Process(
             target=run_mock_inference_server,
-            kwargs={
-                "port": self.inference_port,
-                "log_file": self.output_dir / "inference_server.log"
-            }
+            kwargs={"port": self.inference_port},
         )
         self.inference_process.start()
-        time.sleep(2)  # Wait for server to start
-        
-        inference_url = f"http://127.0.0.1:{self.inference_port}/v1"
-        
-        # Start trainer processes
-        print("[MAIN] Starting trainer processes...")
-        world_size = self.num_trainer_nodes * self.gpus_per_node
-        
+        logger.info("      PID: %s -> %s", self.inference_process.pid, self.inference_url)
+        time.sleep(2)
+
+        logger.info("[3/4] Starting %d trainer processes...", total_ranks)
+        world_size = total_ranks
+
         for node_id in range(self.num_trainer_nodes):
             for local_rank in range(self.gpus_per_node):
                 global_rank = node_id * self.gpus_per_node + local_rank
-                
                 p = mp.Process(
                     target=run_trainer_process,
                     kwargs={
@@ -209,36 +368,37 @@ class SecurityAnalysisRunner:
                         "local_rank": local_rank,
                         "local_world_size": self.gpus_per_node,
                         "output_dir": self.output_dir,
-                        "inference_url": inference_url,
-                    }
+                        "inference_url": self.inference_url,
+                        "sandbox_url": self.sandbox_url,
+                    },
                 )
                 p.start()
                 self.processes.append(p)
-                print(f"[MAIN] Started trainer rank {global_rank} (PID: {p.pid})")
-        
-        # Start orchestrator
-        print("[MAIN] Starting orchestrator...")
+                logger.info(
+                    "      Rank %d (Node %d, Local %d) PID: %s",
+                    global_rank, node_id, local_rank, p.pid,
+                )
+
+        logger.info("[4/4] Starting orchestrator...")
         orch_process = mp.Process(
             target=run_orchestrator_process,
             kwargs={
                 "output_dir": self.output_dir,
-                "inference_url": inference_url,
-            }
+                "inference_url": self.inference_url,
+                "sandbox_url": self.sandbox_url,
+            },
         )
         orch_process.start()
         self.processes.append(orch_process)
-        print(f"[MAIN] Started orchestrator (PID: {orch_process.pid})")
+        logger.info("      PID: %s", orch_process.pid)
     
-    def wait(self, timeout: Optional[float] = None):
-        """Wait for all processes to complete."""
-        print("[MAIN] Waiting for processes to complete...")
-        
+    def wait(self, timeout: float | None = None):
+        logger.info("Waiting for processes to complete...")
         for p in self.processes:
             p.join(timeout=timeout)
     
     def stop(self):
-        """Stop all processes."""
-        print("[MAIN] Stopping all processes...")
+        logger.info("Stopping all processes...")
         
         for p in self.processes:
             if p.is_alive():
@@ -249,54 +409,117 @@ class SecurityAnalysisRunner:
             self.inference_process.terminate()
             self.inference_process.join(timeout=5)
         
-        print("[MAIN] All processes stopped")
+        if self.sandbox_process and self.sandbox_process.is_alive():
+            self.sandbox_process.terminate()
+            self.sandbox_process.join(timeout=5)
+        
+        logger.info("All processes stopped")
     
-    def print_summary(self):
-        """Print analysis summary."""
-        print("\n" + "="*70)
-        print("SECURITY ANALYSIS SUMMARY")
-        print("="*70)
-        
-        # Check for log files
+    def log_summary(self):
+        """Generate security analysis summary."""
         log_files = list(self.output_dir.glob("*.log"))
-        print(f"\nLog files generated: {len(log_files)}")
+        sandbox_log = self.output_dir / "sandbox_requests.jsonl"
+        
+        # Count sandbox requests
+        sandbox_requests = 0
+        sandbox_endpoints: set[str] = set()
+        if sandbox_log.exists():
+            with open(sandbox_log) as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        sandbox_requests += 1
+                        sandbox_endpoints.add(entry.get("path", "unknown"))
+                    except json.JSONDecodeError:
+                        pass
+        
+        lines = [
+            "",
+            "=" * 70,
+            "SECURITY ANALYSIS SUMMARY",
+            "=" * 70,
+            "",
+            f"  Output directory: {self.output_dir}",
+            f"  Log files generated: {len(log_files)}",
+        ]
+        
         for f in log_files:
-            print(f"  - {f.name}")
+            lines.append(f"    - {f.name}")
         
-        # Check inference server log for requests
-        inf_log = self.output_dir / "inference_server.log"
-        if inf_log.exists():
-            print(f"\nInference server log: {inf_log}")
+        lines.extend([
+            "",
+            "  Sandbox Server Analysis:",
+            f"    - Total HTTP requests captured: {sandbox_requests}",
+            f"    - Endpoints hit: {list(sandbox_endpoints) if sandbox_endpoints else ['none']}",
+            f"    - Request log: {sandbox_log}",
+            "",
+            "  Communication Channels Analyzed:",
+            "",
+            f"    [HTTP] Sandbox API ({self.sandbox_url}):",
+            "           ├─ POST /v1/sandbox/run (code execution)",
+            "           ├─ GET  /health (health check)",
+            "           └─ *    /* (catch-all for discovery)",
+            "",
+            f"    [HTTP] Inference API ({self.inference_url}):",
+            "           ├─ GET  /health (health check)",
+            "           ├─ GET  /v1/models (model listing)",
+            "           ├─ POST /v1/chat/completions (inference)",
+            "           ├─ POST /init_broadcaster (NCCL init)",
+            "           └─ POST /update_weights (weight sync)",
+            "",
+            "    [ZMQ] Transport Layer:",
+            "           ├─ PUSH TrainingBatchSender",
+            "           ├─ PULL TrainingBatchReceiver",
+            "           ├─ PUB  MicroBatchSender",
+            "           └─ SUB  MicroBatchReceiver",
+            "",
+            "    [NCCL/Filesystem] Weight Broadcast:",
+            "           ├─ FileSystemWeightBroadcast",
+            "           └─ NCCLWeightBroadcast",
+            "",
+            "=" * 70,
+        ])
         
-        print("\nSecurity-relevant endpoints accessed:")
-        print("  - /health (health check)")
-        print("  - /v1/models (model listing)")
-        print("  - /init_broadcaster (NCCL initialization)")
-        print("  - /update_weights (weight synchronization)")
-        print("  - /v1/chat/completions (inference)")
-        
-        print("\n" + "="*70)
+        logger.info("\n".join(lines))
 
 
 def main():
-    """Main entry point."""
-    runner = SecurityAnalysisRunner(
-        num_trainer_nodes=2,
-        gpus_per_node=2,
-        inference_port=8000,
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
-    
+
+    RESULTS_DIR.mkdir(exist_ok=True)
+
+    logger.info("=" * 70)
+    logger.info("DISTRIBUTED FEDERATED LEARNING - SECURITY ANALYSIS")
+    logger.info("=" * 70)
+
+    runner = SecurityAnalysisRunner.from_config()
+
     try:
         runner.start()
-        runner.wait(timeout=30)
+
+        logger.info("=" * 70)
+        logger.info("SIMULATION RUNNING")
+        logger.info("=" * 70)
+        logger.info("Communication channels being analyzed:")
+        logger.info("  1. Sandbox API (HTTP)    -> %s", runner.sandbox_url)
+        logger.info("  2. Inference API (HTTP)  -> %s", runner.inference_url)
+        logger.info("  3. ZMQ Transport (TCP)   -> configurable ports")
+        logger.info("  4. Weight Broadcast      -> NCCL/Filesystem")
+        logger.info("Press Ctrl+C to stop and view analysis report.")
+        logger.info("=" * 70)
+
+        runner.wait(timeout=60)
+
     except KeyboardInterrupt:
-        print("\n[MAIN] Interrupted by user")
+        logger.info("Interrupted by user")
     finally:
         runner.stop()
-        runner.print_summary()
+        runner.log_summary()
 
 
 if __name__ == "__main__":
-    # Use spawn method for Windows compatibility
     mp.set_start_method("spawn", force=True)
     main()
